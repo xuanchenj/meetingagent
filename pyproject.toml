@@ -1,0 +1,12 @@
+[project]
+name = "meeting-agnet"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "dashscope>=1.25.18",
+    "livekit>=1.1.8",
+    "livekit-agents[cartesia,deepgram,openai,silero,turn-detector]>=1.5.10",
+    "livekit-api>=1.1.0",
+    "python-dotenv>=1.2.2",
+]
