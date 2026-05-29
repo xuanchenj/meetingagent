@@ -4,15 +4,20 @@ import asyncio
 import json
 import os
 import uuid
+import weakref
 from dataclasses import dataclass
+from collections.abc import Callable
+from typing import Any, AsyncIterable
 
-from websockets.asyncio.client import connect as ws_connect
+import websockets
+from livekit import rtc
+from websockets.asyncio.client import ClientConnection, connect as ws_connect
 
 from livekit.agents import (
     APIConnectionError,
     APIConnectOptions,
     tts,
-    utils,
+    utils, ModelSettings,
 )
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 
@@ -20,13 +25,6 @@ from .log import logger
 
 SERVER_URI = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 NUM_CHANNELS = 1
-
-# 句子硬断句符
-_SENTENCE_ENDS = frozenset("。！？!?\n")
-# 软断句符（句子过长时在此处切分）
-_SOFT_ENDS = frozenset("，,；;、")
-# 超过此字数未遇到任何断句符则强制切分
-_MAX_CHARS_BEFORE_SPLIT = 60
 
 
 @dataclass
@@ -38,281 +36,6 @@ class _TTSOptions:
     volume: int
     rate: float
     pitch: float
-
-
-class TTS(tts.TTS):
-    def __init__(
-        self,
-        *,
-        api_key: str | None = None,
-        model: str = "cosyvoice-v3-flash",
-        voice: str = "longanhuan",
-        sample_rate: int = 16000,
-        volume: int = 50,
-        rate: float = 1.0,
-        pitch: float = 1.0,
-    ) -> None:
-        """
-        创建阿里云 CosyVoice TTS 实例。
-
-        Args:
-            api_key: 阿里云 API Key，未提供时从 BAILIAN_API_KEY 环境变量读取。
-            model: TTS 模型名称，默认 cosyvoice-v3-flash。
-            voice: 音色 ID，默认 longanhuan。
-            sample_rate: 音频采样率（Hz），默认 16000。
-            volume: 音量（0-100），默认 50。
-            rate: 语速倍率（0.5-2.0），默认 1.0。
-            pitch: 音调（0.5-2.0），默认 1.0。
-        """
-        super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=True),
-            sample_rate=sample_rate,
-            num_channels=NUM_CHANNELS,
-        )
-
-        resolved_api_key = api_key or os.environ.get("BAILIAN_API_KEY")
-        if not resolved_api_key:
-            raise ValueError(
-                "阿里云 API Key 未设置，请传入 api_key 参数或设置 BAILIAN_API_KEY 环境变量"
-            )
-
-        self._opts = _TTSOptions(
-            api_key=resolved_api_key,
-            model=model,
-            voice=voice,
-            sample_rate=sample_rate,
-            volume=max(0, min(100, volume)),
-            rate=max(0.5, min(2.0, rate)),
-            pitch=max(0.5, min(2.0, pitch)),
-        )
-
-    @property
-    def provider(self) -> str:
-        return "Ali-CosyVoice"
-
-    def synthesize(
-        self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
-    ) -> ChunkedStream:
-        return ChunkedStream(tts=self, input_text=text, conn_options=conn_options)
-
-    def stream(
-        self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
-    ) -> SynthesizeStream:
-        return SynthesizeStream(tts=self, conn_options=conn_options)
-
-
-class ChunkedStream(tts.ChunkedStream):
-    """非流式合成（synthesize / session.say() 场景）。"""
-
-    def __init__(self, *, tts: TTS, input_text: str, conn_options: APIConnectOptions) -> None:
-        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
-        self._opts = tts._opts
-
-    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
-        task_id = str(uuid.uuid4())
-        output_emitter.initialize(
-            request_id=task_id,
-            sample_rate=self._opts.sample_rate,
-            num_channels=NUM_CHANNELS,
-            mime_type="audio/pcm",
-        )
-        try:
-            async with ws_connect(
-                SERVER_URI,
-                additional_headers={
-                    "Authorization": f"bearer {self._opts.api_key}",
-                    "X-DashScope-DataInspection": "enable",
-                },
-            ) as ws:
-                await ws.send(json.dumps(_build_run_task_cmd(task_id, self._opts)))
-                while True:
-                    response = await ws.recv()
-                    if isinstance(response, bytes):
-                        output_emitter.push(response)
-                        continue
-                    msg = json.loads(response)
-                    event = msg.get("header", {}).get("event", "")
-                    if event == "task-started":
-                        await ws.send(json.dumps({
-                            "header": {"action": "continue-task", "task_id": task_id, "streaming": "duplex"},
-                            "payload": {"input": {"text": self._input_text}},
-                        }))
-                        await ws.send(json.dumps({
-                            "header": {"action": "finish-task", "task_id": task_id, "streaming": "duplex"},
-                            "payload": {"input": {}},
-                        }))
-                    elif event == "task-finished":
-                        output_emitter.flush()
-                        break
-                    elif event == "task-failed":
-                        error_msg = msg.get("header", {}).get("error_message", "未知错误")
-                        raise APIConnectionError(f"阿里 TTS 任务失败: {error_msg}")
-        except APIConnectionError:
-            raise
-        except Exception as e:
-            raise APIConnectionError() from e
-
-
-class SynthesizeStream(tts.SynthesizeStream):
-    """
-    流式文本合成，仿照 Deepgram 的 segment 机制：
-
-    1. 将 LLM 流式文本按句子边界切分
-    2. 每个句子 = 一个独立的 Ali TTS task = 一个 emitter segment
-    3. 逐句顺序合成，等 task-finished 后再开始下一句
-    4. 每句各自建立 WebSocket 连接，用完即断
-
-    效果：任何时刻 pipeline 里最多只有「当前句子」的音频，
-    打断后的尾音从「整个回复」缩减到「最多一句话」。
-    """
-
-    def __init__(self, *, tts: TTS, conn_options: APIConnectOptions) -> None:
-        super().__init__(tts=tts, conn_options=conn_options)
-        self._opts = tts._opts
-
-    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
-        output_emitter.initialize(
-            request_id=utils.shortuuid(),
-            sample_rate=self._opts.sample_rate,
-            num_channels=NUM_CHANNELS,
-            mime_type="audio/pcm",
-            stream=True,
-        )
-
-        sentence_ch: utils.aio.Chan[str] = utils.aio.Chan()
-
-        async def split_sentences() -> None:
-            """将 LLM token 流按句子边界切分，推入 sentence_ch。"""
-            buf = ""
-            async for data in self._input_ch:
-                if isinstance(data, str):
-                    buf += data
-                    while True:
-                        pos = next(
-                            (i for i, c in enumerate(buf) if c in _SENTENCE_ENDS), -1
-                        )
-                        if pos == -1:
-                            break
-                        sentence = buf[: pos + 1].strip()
-                        buf = buf[pos + 1 :]
-                        if sentence:
-                            sentence_ch.send_nowait(sentence)
-                    # 超长时按软断句符或强制切分
-                    while len(buf) >= _MAX_CHARS_BEFORE_SPLIT:
-                        soft_pos = next(
-                            (i for i, c in enumerate(buf) if c in _SOFT_ENDS), -1
-                        )
-                        split_at = soft_pos if soft_pos > 0 else _MAX_CHARS_BEFORE_SPLIT - 1
-                        sentence = buf[: split_at + 1].strip()
-                        buf = buf[split_at + 1 :]
-                        if sentence:
-                            sentence_ch.send_nowait(sentence)
-                elif isinstance(data, self._FlushSentinel):
-                    break
-            if buf.strip():
-                sentence_ch.send_nowait(buf.strip())
-            sentence_ch.close()
-
-        async def synthesize_sentences() -> None:
-            """逐句调用 Ali TTS，等 task-finished 后再开始下一句。"""
-            async for sentence in sentence_ch:
-                await _run_ws_sentence(
-                    sentence=sentence,
-                    output_emitter=output_emitter,
-                    opts=self._opts,
-                    conn_options=self._conn_options,
-                    mark_started_cb=self._mark_started,
-                )
-
-        tasks = [
-            asyncio.create_task(split_sentences()),
-            asyncio.create_task(synthesize_sentences()),
-        ]
-        try:
-            await asyncio.gather(*tasks)
-        except APIConnectionError:
-            raise
-        except Exception as e:
-            raise APIConnectionError() from e
-        finally:
-            await utils.aio.gracefully_cancel(*tasks)
-
-
-async def _run_ws_sentence(
-    *,
-    sentence: str,
-    output_emitter: tts.AudioEmitter,
-    opts: _TTSOptions,
-    conn_options: APIConnectOptions,
-    mark_started_cb,
-) -> None:
-    """
-    对应 Deepgram 的 _run_ws()：为单个句子完整执行一次 Ali TTS task，
-    收到 task-finished 后调用 end_segment() 并返回。
-    """
-    task_id = str(uuid.uuid4())
-    segment_id = utils.shortuuid()
-    output_emitter.start_segment(segment_id=segment_id)
-
-    task_started = asyncio.Event()
-
-    try:
-        async with ws_connect(
-            SERVER_URI,
-            additional_headers={
-                "Authorization": f"bearer {opts.api_key}",
-                "X-DashScope-DataInspection": "enable",
-            },
-        ) as ws:
-            await ws.send(json.dumps(_build_run_task_cmd(task_id, opts)))
-
-            async def send_task() -> None:
-                await task_started.wait()
-                mark_started_cb()
-                await ws.send(json.dumps({
-                    "header": {"action": "continue-task", "task_id": task_id, "streaming": "duplex"},
-                    "payload": {"input": {"text": sentence}},
-                }))
-                await ws.send(json.dumps({
-                    "header": {"action": "finish-task", "task_id": task_id, "streaming": "duplex"},
-                    "payload": {"input": {}},
-                }))
-                logger.debug("[AliTTS] 句子已发送: %s", sentence[:20])
-
-            async def recv_task() -> None:
-                while True:
-                    response = await ws.recv()
-                    if isinstance(response, bytes):
-                        output_emitter.push(response)
-                        continue
-                    msg = json.loads(response)
-                    event = msg.get("header", {}).get("event", "")
-                    if event == "task-started":
-                        logger.debug("[AliTTS] task-started (%.10s…)", sentence)
-                        task_started.set()
-                    elif event == "task-finished":
-                        logger.debug("[AliTTS] task-finished (%.10s…)", sentence)
-                        output_emitter.end_segment()
-                        break
-                    elif event == "task-failed":
-                        error_msg = msg.get("header", {}).get("error_message", "未知错误")
-                        logger.error("[AliTTS] task-failed: %s", error_msg)
-                        raise APIConnectionError(f"阿里 TTS 任务失败: {error_msg}")
-
-            inner_tasks = [
-                asyncio.create_task(send_task()),
-                asyncio.create_task(recv_task()),
-            ]
-            try:
-                await asyncio.gather(*inner_tasks)
-            finally:
-                task_started.set()
-                await utils.aio.gracefully_cancel(*inner_tasks)
-
-    except APIConnectionError:
-        raise
-    except Exception as e:
-        raise APIConnectionError() from e
 
 
 def _build_run_task_cmd(task_id: str, opts: _TTSOptions) -> dict:
@@ -339,3 +62,434 @@ def _build_run_task_cmd(task_id: str, opts: _TTSOptions) -> dict:
             "input": {},
         },
     }
+
+
+def _build_continue_task_cmd(task_id: str, text: str) -> dict:
+    return {
+        "header": {
+            "action": "continue-task",
+            "task_id": task_id,
+            "streaming": "duplex",
+        },
+        "payload": {"input": {"text": text}},
+    }
+
+
+def _build_finish_task_cmd(task_id: str) -> dict:
+    return {
+        "header": {
+            "action": "finish-task",
+            "task_id": task_id,
+            "streaming": "duplex",
+        },
+        "payload": {"input": {}},
+    }
+
+
+async def _cancel_tasks(tasks: list[asyncio.Task]) -> None:
+    """取消并等待后台任务结束，避免 Task exception was never retrieved。"""
+    if not tasks:
+        return
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    await utils.aio.gracefully_cancel(*tasks)
+
+
+async def _close_ws_quietly(ws: ClientConnection | None) -> None:
+    if ws is None:
+        return
+    try:
+        await ws.close()
+    except Exception:
+        pass
+
+async def send_text(task_id, websocket, text:AsyncIterable[str]):
+    try:
+        async for t in text:
+            cmd = {
+                "header": {
+                    "action": "continue-task",
+                    "task_id": task_id,
+                    "streaming": "duplex"
+                },
+                "payload": {
+                    "input": {
+                        "text": t
+                    }
+                }
+            }
+            await websocket.send(json.dumps(cmd))
+        finsh_cmd = {
+            "header": {
+                "action": "finish-task",
+                "task_id": task_id,
+                "streaming": "duplex"
+            },
+            "payload": {
+                "input": {}
+            }
+        }
+
+        await websocket.send(json.dumps(finsh_cmd))
+    except websockets.exceptions.ConnectionClosed as e:
+        logger.info("!!!!producer close connection close!!!!!!")
+
+
+class TTS(tts.TTS):
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        model: str = "cosyvoice-v3-flash",
+        voice: str = "longanhuan",
+        sample_rate: int = 16000,
+        volume: int = 50,
+        rate: float = 1.0,
+        pitch: float = 1.0,
+    ) -> None:
+        super().__init__(
+            capabilities=tts.TTSCapabilities(streaming=True),
+            sample_rate=sample_rate,
+            num_channels=NUM_CHANNELS,
+        )
+
+        resolved_api_key = api_key or os.environ.get("BAILIAN_API_KEY")
+        if not resolved_api_key:
+            raise ValueError(
+                "阿里云 API Key 未设置，请传入 api_key 参数或设置 BAILIAN_API_KEY 环境变量"
+            )
+
+        self._opts = _TTSOptions(
+            api_key=resolved_api_key,
+            model=model,
+            voice=voice,
+            sample_rate=sample_rate,
+            volume=max(0, min(100, volume)),
+            rate=max(0.5, min(2.0, rate)),
+            pitch=max(0.5, min(2.0, pitch)),
+        )
+        self._streams: weakref.WeakSet[SynthesizeStream] = weakref.WeakSet()
+
+
+    async def generator(
+            self, text: AsyncIterable[str],  model_settings: ModelSettings
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        taskid = str(uuid.uuid4())
+        # 构造 run-task 指令
+        run_task_cmd = {
+            "header": {
+                "action": "run-task",
+                "task_id": taskid,
+                "streaming": "duplex"
+            },
+            "payload": {
+                "task_group": "audio",
+                "task": "tts",
+                "function": "SpeechSynthesizer",
+                "model": "cosyvoice-v3-flash",
+                "parameters": {
+                    "text_type": "PlainText",
+                    "voice": self._opts.voice,           # 使用实例的音色ID
+                    "format": "pcm",
+                    "sample_rate": self._opts.sample_rate,
+                    "volume": self._opts.volume,            # 使用实例的音量
+                    "rate": self._opts.rate,                # 使用实例的语速倍率
+                    "pitch": self._opts.pitch               # 使用实例的音调
+                },
+                "input": {}
+            }
+        }
+        async with ws_connect(
+                SERVER_URI,
+                additional_headers={
+                    "Authorization": f"bearer {self._opts.api_key}",
+                    "X-DashScope-DataInspection": "enable"
+                }
+        ) as websocket:
+            await websocket.send(json.dumps(run_task_cmd))
+
+            while True:
+                try:
+                    response = await websocket.recv()
+                    if isinstance(response, str):
+                        msg_json = json.loads(response)
+                        if "header" in msg_json:
+                            header = msg_json["header"]
+
+                        if "event" in header:
+                            event = header["event"]
+
+                            if event == "task-started":
+                                asyncio.get_event_loop().create_task(send_text(taskid, websocket, text))
+
+                            elif event == "task-finished":
+                                logger.info("tts finished")
+                                break
+
+                            elif event == "task-failed":
+                                error_msg = msg_json.get("error_message", "未知错误")
+                                logger.info(f"tts error {msg_json}")
+                                logger.info(f"tts error {error_msg}")
+                                break
+                    else:
+                        yield rtc.AudioFrame(response, self.sample_rate, 1, 16)
+                except websockets.exceptions.ConnectionClosed:
+                    logger.exception("tts Connection closed")
+                    break
+                except asyncio.CancelledError:
+                    logger.info("TTS任务被取消")
+                    break
+
+    @property
+    def provider(self) -> str:
+        return "Ali-CosyVoice"
+
+    def synthesize(
+        self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
+    ) -> ChunkedStream:
+        return ChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+
+    def stream(
+        self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
+    ) -> SynthesizeStream:
+        stream = SynthesizeStream(tts=self, conn_options=conn_options)
+        self._streams.add(stream)
+        return stream
+
+    async def aclose(self) -> None:
+        for stream in list(self._streams):
+            await stream.aclose()
+        self._streams.clear()
+
+
+class _WsSession:
+    """单次 Ali TTS WebSocket 会话：统一管理 send/recv 任务与连接回收。"""
+
+    def __init__(
+        self,
+        *,
+        ws: ClientConnection,
+        task_id: str,
+        opts: _TTSOptions,
+    ) -> None:
+        self._ws = ws
+        self._task_id = task_id
+        self._opts = opts
+        self._tasks: list[asyncio.Task] = []
+        self._task_started = asyncio.Event()
+        self._finish_sent = False
+        self._closed = False
+
+    @property
+    def task_started(self) -> asyncio.Event:
+        return self._task_started
+
+    def spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._tasks.append(task)
+        return task
+
+    async def run_send(
+        self,
+        input_ch,
+        *,
+        flush_sentinel: Any,
+        mark_started_cb=None,
+        on_text: Callable[[str], None] | None = None,
+    ) -> None:
+        """从 input 通道读取文本并发送 continue-task，结束时发一次 finish-task。"""
+        try:
+            await self._task_started.wait()
+
+            async for data in input_ch:
+                if isinstance(data, str):
+                    if not data:
+                        continue
+                    if mark_started_cb:
+                        mark_started_cb()
+                    await self._ws.send(
+                        json.dumps(_build_continue_task_cmd(self._task_id, data))
+                    )
+                    if on_text:
+                        on_text(data)
+                elif isinstance(data, flush_sentinel):
+                    break
+
+            await self._send_finish()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 发送失败时仍尝试 finish，便于服务端释放 task
+            await self._send_finish()
+            raise
+
+    async def run_recv(
+        self,
+        *,
+        on_audio: Callable[[bytes], None],
+        on_started: Callable[[], None] | None = None,
+        on_finished: Callable[[], None] | None = None,
+    ) -> None:
+        """接收服务端事件与音频。"""
+        try:
+            while True:
+                response = await self._ws.recv()
+
+                if isinstance(response, bytes):
+                    on_audio(response)
+                    continue
+
+                msg = json.loads(response)
+                event = msg.get("header", {}).get("event", "")
+
+                if event == "task-started":
+                    logger.debug("[AliTTS] task-started")
+                    self._task_started.set()
+                    if on_started:
+                        on_started()
+                elif event == "task-finished":
+                    logger.debug("[AliTTS] task-finished")
+                    if on_finished:
+                        on_finished()
+                    break
+                elif event == "task-failed":
+                    error_msg = msg.get("header", {}).get("error_message", "未知错误")
+                    logger.error("[AliTTS] task-failed: %s", error_msg)
+                    raise APIConnectionError(f"阿里 TTS 任务失败: {error_msg}")
+        except asyncio.CancelledError:
+            raise
+
+    async def _send_finish(self) -> None:
+        if self._finish_sent or self._closed:
+            return
+        if not self._task_started.is_set():
+            return
+        self._finish_sent = True
+        try:
+            await self._ws.send(json.dumps(_build_finish_task_cmd(self._task_id)))
+            logger.debug("[AliTTS] finish-task 已发送")
+        except Exception as e:
+            logger.debug("[AliTTS] finish-task 发送失败: %s", e)
+
+    async def shutdown(self, *, cancel_tasks: bool = True) -> None:
+        """回收：取消后台任务、尝试 finish-task、关闭连接。"""
+        if self._closed:
+            return
+        self._closed = True
+        self._task_started.set()
+
+        if cancel_tasks:
+            await _cancel_tasks(self._tasks)
+        self._tasks.clear()
+
+        await self._send_finish()
+        await _close_ws_quietly(self._ws)
+
+
+class ChunkedStream(tts.ChunkedStream):
+    """非流式合成（synthesize / session.say() 场景）。"""
+
+    def __init__(self, *, tts: TTS, input_text: str, conn_options: APIConnectOptions) -> None:
+        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
+        self._opts = tts._opts
+
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        task_id = str(uuid.uuid4())
+        output_emitter.initialize(
+            request_id=task_id,
+            sample_rate=self._opts.sample_rate,
+            num_channels=NUM_CHANNELS,
+            mime_type="audio/pcm",
+        )
+
+        session: _WsSession | None = None
+        try:
+            async with ws_connect(
+                SERVER_URI,
+                additional_headers={
+                    "Authorization": f"bearer {self._opts.api_key}",
+                    "X-DashScope-DataInspection": "enable",
+                },
+            ) as ws:
+                session = _WsSession(ws=ws, task_id=task_id, opts=self._opts)
+                await ws.send(json.dumps(_build_run_task_cmd(task_id, self._opts)))
+
+                async def send_once() -> None:
+                    await session.task_started.wait()
+                    await ws.send(
+                        json.dumps(_build_continue_task_cmd(task_id, self._input_text))
+                    )
+                    await session._send_finish()
+
+                recv_task = session.spawn(
+                    session.run_recv(
+                        on_audio=output_emitter.push,
+                        on_finished=output_emitter.flush,
+                    )
+                )
+                send_task = session.spawn(send_once())
+                await asyncio.gather(recv_task, send_task)
+
+        except APIConnectionError:
+            raise
+        except Exception as e:
+            raise APIConnectionError() from e
+        finally:
+            if session is not None:
+                await session.shutdown()
+
+
+class SynthesizeStream(tts.SynthesizeStream):
+    def __init__(self, *, tts: TTS, conn_options: APIConnectOptions) -> None:
+        super().__init__(tts=tts, conn_options=conn_options)
+        self._opts = tts._opts
+
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        task_id = str(uuid.uuid4())
+        segment_id = utils.shortuuid()
+
+        output_emitter.initialize(
+            request_id=task_id,
+            sample_rate=self._opts.sample_rate,
+            num_channels=NUM_CHANNELS,
+            mime_type="audio/pcm",
+            stream=True,
+        )
+        output_emitter.start_segment(segment_id=segment_id)
+
+        session: _WsSession | None = None
+        try:
+            async with ws_connect(
+                SERVER_URI,
+                additional_headers={
+                    "Authorization": f"bearer {self._opts.api_key}",
+                    "X-DashScope-DataInspection": "enable",
+                },
+            ) as ws:
+                session = _WsSession(ws=ws, task_id=task_id, opts=self._opts)
+                await ws.send(json.dumps(_build_run_task_cmd(task_id, self._opts)))
+
+                recv_task = session.spawn(
+                    session.run_recv(
+                        on_audio=output_emitter.push,
+                        on_finished=output_emitter.end_segment,
+                    )
+                )
+                send_task = session.spawn(
+                    session.run_send(
+                        self._input_ch,
+                        flush_sentinel=self._FlushSentinel,
+                        mark_started_cb=self._mark_started,
+                        on_text=lambda t: logger.debug("[AliTTS] 发送文本: %s", t),
+                    )
+                )
+                await asyncio.gather(recv_task, send_task)
+
+        except APIConnectionError:
+            raise
+        except Exception as e:
+            raise APIConnectionError() from e
+        finally:
+            if session is not None:
+                await session.shutdown()
