@@ -997,7 +997,7 @@ dependencies = [
 requires-dist = [
     { name = "dashscope", specifier = ">=1.25.18" },
     { name = "livekit", specifier = ">=1.1.8" },
-    { name = "livekit-agents", extras = ["cartesia", "deepgram", "openai", "silero", "turn-detector"], specifier = ">=1.5.10" },
+    { name = "livekit-agents", extras = ["cartesia", "deepgram", "openai", "silero", "turn-detector"], specifier = "~=1.5" },
     { name = "livekit-api", specifier = ">=1.1.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
 ]

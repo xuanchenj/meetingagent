@@ -376,14 +376,26 @@ class _WsSession:
         """回收：取消后台任务、尝试 finish-task、关闭连接。"""
         if self._closed:
             return
-        self._closed = True
         self._task_started.set()
 
         if cancel_tasks:
             await _cancel_tasks(self._tasks)
         self._tasks.clear()
 
+        # 必须在标记 closed 之前发送；旧顺序会被 _send_finish 的 guard
+        # 直接拦截，导致 finish-task 实际上永远发不出去。
         await self._send_finish()
+        self._closed = True
+        await _close_ws_quietly(self._ws)
+
+    async def abort(self) -> None:
+        """打断时立即终止连接，不再请求服务端生成剩余音频。"""
+        if self._closed:
+            return
+        self._closed = True
+        self._task_started.set()
+        await _cancel_tasks(self._tasks)
+        self._tasks.clear()
         await _close_ws_quietly(self._ws)
 
 
@@ -401,9 +413,11 @@ class ChunkedStream(tts.ChunkedStream):
             sample_rate=self._opts.sample_rate,
             num_channels=NUM_CHANNELS,
             mime_type="audio/pcm",
+            frame_size_ms=50,
         )
 
         session: _WsSession | None = None
+        cancelled = False
         try:
             async with ws_connect(
                 SERVER_URI,
@@ -431,13 +445,19 @@ class ChunkedStream(tts.ChunkedStream):
                 send_task = session.spawn(send_once())
                 await asyncio.gather(recv_task, send_task)
 
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except APIConnectionError:
             raise
         except Exception as e:
             raise APIConnectionError() from e
         finally:
             if session is not None:
-                await session.shutdown()
+                if cancelled:
+                    await session.abort()
+                else:
+                    await session.shutdown()
 
 
 class SynthesizeStream(tts.SynthesizeStream):
@@ -454,11 +474,15 @@ class SynthesizeStream(tts.SynthesizeStream):
             sample_rate=self._opts.sample_rate,
             num_channels=NUM_CHANNELS,
             mime_type="audio/pcm",
+            # LiveKit 房间输出也是 50ms 一帧。避免默认 200ms PCM 帧在
+            # 打断边界形成过大的待播放尾部。
+            frame_size_ms=50,
             stream=True,
         )
         output_emitter.start_segment(segment_id=segment_id)
 
         session: _WsSession | None = None
+        cancelled = False
         try:
             async with ws_connect(
                 SERVER_URI,
@@ -486,10 +510,16 @@ class SynthesizeStream(tts.SynthesizeStream):
                 )
                 await asyncio.gather(recv_task, send_task)
 
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except APIConnectionError:
             raise
         except Exception as e:
             raise APIConnectionError() from e
         finally:
             if session is not None:
-                await session.shutdown()
+                if cancelled:
+                    await session.abort()
+                else:
+                    await session.shutdown()

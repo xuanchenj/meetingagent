@@ -1,12 +1,10 @@
 import logging
 import os
-from typing import AsyncIterable, Optional
 
 from dotenv import load_dotenv
-from livekit import rtc
 from livekit.agents import Agent, AgentServer, AgentSession, JobContext, JobProcess, RoomInputOptions, llm, \
-    SessionUsageUpdatedEvent, stt, ModelSettings
-from livekit.plugins import openai, silero
+    SessionUsageUpdatedEvent
+from livekit.plugins import openai, silero, deepgram
 
 from plugins.ali import STT as AliSTT, TTS as AliTTS
 
@@ -37,26 +35,23 @@ class MeetingAgent(Agent):
         self.ttsn = ttsn
         super().__init__(instructions=instructions, tools=tools)
 
-    async def stt_node(
-            self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
-    ) -> Optional[AsyncIterable[stt.SpeechEvent]]:
-        async for itme in self.sttn.generator(audio, model_settings):
-            yield itme
 
-    async def tts_node(
-            self, text: AsyncIterable[str], model_settings: ModelSettings
-    ) -> AsyncIterable[rtc.AudioFrame]:
-        async for itme in self.ttsn.generator(text, model_settings):
-            yield itme
 
 @server.rtc_session(agent_name="meeting_agent")
 async def entry_point(ctx: JobContext):
     logger.info("enter entry point!!!!!!!!!!!!")
 
     stt = AliSTT(sample_rate=16000)
+    # stt=deepgram.STT(
+    #     model="nova-3",
+    #     language="zh-CN",
+    # )
     logger.info("stt init")
 
     tts = AliTTS(voice="longanhuan", sample_rate=16000)
+    # tts=deepgram.TTS(
+    #     model="aura-2-asteria-en",
+    # )
     logger.info("tts init")
 
     llm_model = openai.LLM(

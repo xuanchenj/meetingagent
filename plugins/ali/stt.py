@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import AsyncIterable, Optional
 
 import websockets
-from livekit.agents.stt import SpeechEventType, SpeechData
 from websockets.asyncio.client import ClientConnection, connect as ws_connect
 from livekit import rtc
 from livekit.agents import (
@@ -25,8 +24,9 @@ from .log import logger
 
 SERVER_URI = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 
-# 每次向阿里 ASR 发送的音频块时长（毫秒），避免过短片段影响识别
-_AUDIO_CHUNK_MS = 200
+# 较小的音频块可以降低识别首字和断句延迟。40ms 在 WebSocket 调用频率与
+# 实时性之间较均衡；此前的 200ms 会给每次识别平白增加一段缓冲延迟。
+_AUDIO_CHUNK_MS = 40
 
 
 @dataclass
@@ -35,6 +35,76 @@ class _STTOptions:
     sample_rate: int
     model: str
     language: str
+    max_sentence_silence: int
+
+
+def _speech_events_from_sentence(
+    sentence: dict,
+    *,
+    language: str,
+    request_id: str,
+    speaking: bool,
+) -> tuple[list[stt.SpeechEvent], bool]:
+    """把阿里 sentence 事件转换为 LiveKit 事件，并保留说话状态。"""
+    if sentence.get("heartbeat"):
+        return [], speaking
+
+    text = sentence.get("text", "")
+    if not text:
+        return [], speaking
+
+    events: list[stt.SpeechEvent] = []
+    if not speaking:
+        speaking = True
+        events.append(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.START_OF_SPEECH,
+                request_id=request_id,
+            )
+        )
+
+    is_final = sentence.get("sentence_end") is True
+    raw_begin_time = sentence.get("begin_time")
+    start_time = (
+        raw_begin_time / 1000.0 if isinstance(raw_begin_time, (int, float)) else 0.0
+    )
+    raw_end_time = sentence.get("end_time")
+    if raw_end_time is None and sentence.get("words"):
+        raw_end_time = sentence["words"][-1].get("end_time")
+    end_time = (
+        raw_end_time / 1000.0
+        if is_final and isinstance(raw_end_time, (int, float))
+        else 0.0
+    )
+
+    events.append(
+        stt.SpeechEvent(
+            type=(
+                stt.SpeechEventType.FINAL_TRANSCRIPT
+                if is_final
+                else stt.SpeechEventType.INTERIM_TRANSCRIPT
+            ),
+            request_id=request_id,
+            alternatives=[
+                stt.SpeechData(
+                    language=language,
+                    text=text,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+            ],
+        )
+    )
+    if is_final:
+        speaking = False
+        events.append(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.END_OF_SPEECH,
+                request_id=request_id,
+            )
+        )
+
+    return events, speaking
 
 async def send_audio(audio: AsyncIterable[rtc.AudioFrame], websocket, task_id: str):
     async for frame in audio:
@@ -58,7 +128,7 @@ async def send_stop(task_id: str, websocket):
     await websocket.send(json.dumps(finsh_cmd))
     logger.info(f"[AliParaformerSTTAws] send_stop 结束")
 
-async def start_task(websocket, sample_rate):
+async def start_task(websocket, sample_rate, max_sentence_silence=300):
     task_id = str(uuid.uuid4())
     run_task_cmd = {
         "header": {
@@ -76,7 +146,8 @@ async def start_task(websocket, sample_rate):
                 "sample_rate": sample_rate, # 采样率
                 "disfluency_removal_enabled": False, # 过滤语气词
                 "heartbeat":True, # 心跳
-                "semantic_punctuation_enabled": True, # 语义标点
+                "semantic_punctuation_enabled": False,
+                "max_sentence_silence": max_sentence_silence,
                 "language_hints": [
                     "zh"
                 ] # 指定语言，仅支持paraformer-realtime-v2模型
@@ -91,6 +162,7 @@ async def start_task(websocket, sample_rate):
         }
     }
     await websocket.send(json.dumps(run_task_cmd))
+    return task_id
 
 
 class STT(stt.STT):
@@ -101,6 +173,7 @@ class STT(stt.STT):
         sample_rate: int = 16000,
         model: str = "paraformer-realtime-v2",
         language: str = "zh",
+        max_sentence_silence: int = 300,
     ) -> None:
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -119,7 +192,7 @@ class STT(stt.STT):
             sample_rate=sample_rate,
             model=model,
             language=language,
-
+            max_sentence_silence=max(200, min(6000, max_sentence_silence)),
         )
 
     async def generator(
@@ -133,7 +206,12 @@ class STT(stt.STT):
                 "X-DashScope-DataInspection": "enable"
             }
         )
-        self.task_id = await start_task(self.websocket, self._opts.sample_rate)
+        self.task_id = await start_task(
+            self.websocket,
+            self._opts.sample_rate,
+            self._opts.max_sentence_silence,
+        )
+        speaking = False
         try:
             while True:
                 response = await self.websocket.recv()
@@ -165,25 +243,22 @@ class STT(stt.STT):
                                     "X-DashScope-DataInspection": "enable"
                                 }
                             )
-                            self.task_id = await start_task(self.websocket, self._opts.sample_rate)
+                            self.task_id = await start_task(
+                                self.websocket,
+                                self._opts.sample_rate,
+                                self._opts.max_sentence_silence,
+                            )
 
                         elif event == "result-generated":
                             sentence = msg_json["payload"]["output"]["sentence"]
-                            if "text" in sentence:
-                                asr_text = sentence["text"]
-                                print("收到asr文本：", asr_text)
-                                type = SpeechEventType.INTERIM_TRANSCRIPT
-                                if sentence.get("end_time"):
-                                    type = SpeechEventType.FINAL_TRANSCRIPT
-                                start_time = sentence.get("start_time", 0)
-                                end_time = sentence.get("end_time", 0)
-                                sd = SpeechData(
-                                    language = "zh",
-                                    text= asr_text,
-                                    start_time = start_time,
-                                    end_time = end_time,
-                                )
-                                yield stt.SpeechEvent(type=type, alternatives=[sd])
+                            events, speaking = _speech_events_from_sentence(
+                                sentence,
+                                language=self._opts.language,
+                                request_id=self.task_id,
+                                speaking=speaking,
+                            )
+                            for speech_event in events:
+                                yield speech_event
                 else:
                     continue
         finally:
@@ -261,7 +336,10 @@ class SpeechStream(stt.SpeechStream):
                         "sample_rate": self._opts.sample_rate,
                         "disfluency_removal_enabled": False,
                         "heartbeat": True,
-                        "semantic_punctuation_enabled": True,
+                        # 语义断句适合会议转写，但会关闭服务端 VAD 断句并显著
+                        # 增加对话延迟。实时 Agent 使用低延迟 VAD 断句。
+                        "semantic_punctuation_enabled": False,
+                        "max_sentence_silence": self._opts.max_sentence_silence,
                         "language_hints": [self._opts.language],
                     },
                     "resources": [],
@@ -302,6 +380,7 @@ class SpeechStream(stt.SpeechStream):
             logger.debug("[AliSTT] 已发送 finish-task 指令")
 
         async def recv_task() -> None:
+            speaking = False
             while True:
                 response = await ws.recv()
                 if not isinstance(response, str):
@@ -317,36 +396,22 @@ class SpeechStream(stt.SpeechStream):
 
                 elif event == "result-generated":
                     sentence = msg.get("payload", {}).get("output", {}).get("sentence", {})
-                    text = sentence.get("text", "")
-                    if not text:
+                    events, speaking = _speech_events_from_sentence(
+                        sentence,
+                        language=self._opts.language,
+                        request_id=task_id,
+                        speaking=speaking,
+                    )
+                    for speech_event in events:
+                        self._event_ch.send_nowait(speech_event)
+                    if not events:
                         continue
-
-                    is_final = bool(sentence.get("end_time"))
-                    event_type = (
-                        stt.SpeechEventType.FINAL_TRANSCRIPT
-                        if is_final
-                        else stt.SpeechEventType.INTERIM_TRANSCRIPT
-                    )
-                    start_time = sentence.get("start_time", 0) / 1000.0
-                    end_time = sentence.get("end_time", 0) / 1000.0 if is_final else 0.0
-
-                    self._event_ch.send_nowait(
-                        stt.SpeechEvent(
-                            type=event_type,
-                            alternatives=[
-                                stt.SpeechData(
-                                    language=self._opts.language,
-                                    text=text,
-                                    start_time=start_time,
-                                    end_time=end_time,
-                                )
-                            ],
-                        )
-                    )
                     logger.debug(
                         "[AliSTT] %s: %s",
-                        "FINAL" if is_final else "INTERIM",
-                        text,
+                        "FINAL"
+                        if sentence.get("sentence_end") is True
+                        else "INTERIM",
+                        sentence.get("text", ""),
                     )
 
                 elif event == "task-finished":
